@@ -6,48 +6,44 @@ import numpy as np
 import tensorflow as tf
 import gensim
 
-from tensorflow.python.ops.rnn_cell import RNNCell, BasicRNNCell, GRUCell
+from tensorflow.python.ops.rnn_cell import RNNCell, BasicRNNCell, GRUCell, DropoutWrapper
 from q2_initialization import xavier_weight_init
 
 from collections import defaultdict
 import matplotlib.pyplot as plt
 
 from utils import Vocab, Speakers, load_chapter_split, data_iterator, calculate_confusion, print_confusion
-from tensorflow_rnn import bidirectional_dynamic_rnn
-
-SUPERDEBUG = False
-class ModelType:
-    BASIC_SOFTMAX = 1
-    BASIC_RNN = 2
-    BASIC_BIRNN = 3
-    BI_BIRNN = 4
+from tensorflow_birnn import bidirectional_dynamic_rnn
 
 class Config(object):
     """Holds model hyperparams and data information.
        Model objects are passed a Config() object at instantiation.
     """
+    # wordvecpath = "glove.840B.300d.filtered.txt"
     wordvecpath = "glove.6B.100d.filtered.txt"
+    
     datapath = "futurama/futurama.txt"
     datasplitpath = "futurama/futurama_split.txt"
     speaker_count = 8
-    # wordvecpath = "glove.6B.50d.filtered.txt"
     # datapath = "prideprejudice/prideprejudice.txt"
     # datasplitpath = "prideprejudice/prideprejudice_split.txt"
     # speaker_count = 4
 
-    max_line_length = 1000  # for chopping
+    max_line_length = 500  # for chopping
 
     embed_size = int(wordvecpath.split(".")[2][:-1])
     # batch_size = 120
     batch_size = "chapter"
     early_stopping = 2
-    max_epochs = 30
+    max_epochs = 60
     dropout = 0.9
-    lr = 0.001
+    lr = 0.002
     l2 = 0.0001
-    # l2 = 0.
+    anneal_threshold = .995
+    anneal_by = 1.5
     weight_loss = True
-    model_name = 'rnn_embed=%d_l2=%f_lr=%f.weights' % (embed_size, l2, lr)
+    bidirectional_sentences = True
+    bidirectional_conversations = True
 
 class WhoseLineModel(object):
 
@@ -72,7 +68,6 @@ class WhoseLineModel(object):
                 self.speakers.add_speaker(speaker)
         self.speakers.prune(self.config.speaker_count-1)  # -1 for OTHER
 
-        # TODO: for now, not doing anything special with chapter boundaries
         self.train_data = []
         self.dev_data = []
         self.test_data = []
@@ -116,53 +111,62 @@ class SumRNNCell(RNNCell):
 
     def __call__(self, inputs, state, scope=None):
         """(Most-er) most basic RNN: output = new_state = input + state."""
-#         with tf.variable_scope("word_vectors", reuse=True):
-#             L = tf.get_variable("embedding")
-#         with vs.variable_scope(scope or type(self).__name__):  # "SumRNNCell"
         output = inputs + state
         return output, output
     
 class WhoseLineSoftmaxModel(WhoseLineModel):
-    # aka a basic test of dynamic_rnn
     
     def add_placeholders(self):
-        max_line_length = self.config.max_line_length
         self.lines_placeholder = tf.placeholder(tf.int32, shape=(None, None))
         self.line_length_placeholder = tf.placeholder(tf.int32, shape=(None,))
         self.labels_placeholder = tf.placeholder(tf.int32, shape=(None,))
         self.loss_weights_placeholder = tf.placeholder(tf.float32, shape=(None,))
+        self.dropout_placeholder = tf.placeholder(tf.float32)
+        self.l2_placeholder = tf.placeholder(tf.float32)
         
-    def create_feed_dict(self, lines_batch, line_length_batch, labels_batch, loss_weights_batch = None):
+    def create_feed_dict(self, lines_batch, line_length_batch, labels_batch, dropout, l2, loss_weights_batch = None):
         if loss_weights_batch == None:
             loss_weights_batch = np.ones_like(labels_batch, np.float32)
         feed_dict = {self.lines_placeholder: lines_batch,
                      self.line_length_placeholder: line_length_batch,
                      self.labels_placeholder: labels_batch,
+                     self.dropout_placeholder: dropout,
+                     self.l2_placeholder: l2,
                      self.loss_weights_placeholder: loss_weights_batch}
         return feed_dict
         
     def add_model(self):
         embed_size = self.config.embed_size
-        num_speakers = len(self.speakers)
+        num_speakers = self.config.speaker_count
+        self.embedded_lines = tf.gather(self.tf_embedding_matrix, self.lines_placeholder)
+        sentence_summary_size = self.add_sentence_summaries(embed_size)
+        conversation_state_size = self.add_conversational_context(sentence_summary_size)
         with tf.variable_scope("linear_softmax"):
-            W = tf.get_variable("weights", (embed_size, num_speakers), initializer=xavier_weight_init())
+            W = tf.get_variable("weights", (conversation_state_size, num_speakers), initializer=xavier_weight_init())
             b = tf.get_variable("biases", (num_speakers,))
-        sumrnncell = SumRNNCell(embed_size)
-        embedded_lines = tf.gather(self.tf_embedding_matrix, self.lines_placeholder)
-        _, state = tf.nn.dynamic_rnn(sumrnncell,
-                                     embedded_lines,
-                                     self.line_length_placeholder,
-                                     dtype = tf.float32) # state = sum of wvs
-                                     # initial_state = tf.zeros((batch_size, embed_size)))
-        self.state = tf.div(state, tf.to_float(tf.reshape(self.line_length_placeholder, (-1, 1))))  # average of wv (self, for debugging)
-        return tf.matmul(self.state, W) + b  # logits
+        return tf.nn.dropout(tf.matmul(self.conversation_state, W) + b, self.dropout_placeholder)  # logits
+
+    def add_sentence_summaries(self, wordvector_embed_size):
+        # simple average of the wordvectors in the sentence
+        sumrnncell = SumRNNCell(wordvector_embed_size)
+        _, state = tf.nn.dynamic_rnn(sumrnncell, self.embedded_lines, self.line_length_placeholder, dtype = tf.float32)
+        self.sentence_summaries = tf.div(state, tf.to_float(tf.reshape(self.line_length_placeholder, (-1, 1))))
+        return wordvector_embed_size
+
+    def add_conversational_context(self, sentence_summary_size):
+        # no context is taken into account; classification is based purely on sentence content
+        with tf.variable_scope("hidden_layer"):
+            W = tf.get_variable("weights", (sentence_summary_size, sentence_summary_size), initializer=xavier_weight_init())
+            b = tf.get_variable("biases", (sentence_summary_size,))
+        self.conversation_state = tf.tanh(tf.nn.dropout(tf.matmul(self.sentence_summaries, W) + b, self.dropout_placeholder))
+        return sentence_summary_size
 
     def add_loss_op(self, y):
         loss = tf.reduce_mean(tf.mul(tf.nn.sparse_softmax_cross_entropy_with_logits(y, self.labels_placeholder), self.loss_weights_placeholder))
         weight_matrices = [v for v in tf.all_variables() if "weights" in v.name or "Matrix" in v.name]
         print [wmat.name for wmat in weight_matrices]
         for wmat in weight_matrices:
-            loss = loss + self.config.l2*tf.nn.l2_loss(wmat)
+            loss = loss + self.l2_placeholder*tf.nn.l2_loss(wmat)
         return loss
     
     def add_training_op(self, loss):
@@ -176,12 +180,13 @@ class WhoseLineSoftmaxModel(WhoseLineModel):
         y = self.add_model()
         self.loss = self.add_loss_op(y)
         self.predictions = tf.nn.softmax(y)
-        one_hot_prediction = tf.argmax(self.predictions, 1)
-        self.correct_predictions = tf.reduce_sum(tf.cast(tf.equal(self.labels_placeholder, tf.to_int32(one_hot_prediction)), 'int32'))
+        self.one_hot_predictions = tf.argmax(self.predictions, 1)
+        self.correct_predictions = tf.reduce_sum(tf.cast(tf.equal(self.labels_placeholder, tf.to_int32(self.one_hot_predictions)), 'int32'))
         self.train_op = self.add_training_op(self.loss)
     
     def run_epoch(self, session, input_data, shuffle=False, verbose=True):
         dp = self.config.dropout
+        l2 = self.config.l2
         # We're interested in keeping track of the loss and accuracy during training
         total_loss = []
         total_correct_examples = 0
@@ -197,16 +202,11 @@ class WhoseLineSoftmaxModel(WhoseLineModel):
                 f = lambda x: np.sqrt(x)
                 normalization_factor = np.mean([1./f(ct) for ct in self.speakers.speaker_freq.values()])
                 self.index_to_weight = {k:1./(normalization_factor*f(self.speakers.speaker_freq[v])) for k,v in self.speakers.index_to_speaker.items()}
-                feed = self.create_feed_dict(lines, line_lengths, labels, [self.index_to_weight[l] for l in labels])
+                feed = self.create_feed_dict(lines, line_lengths, labels, dp, l2, [self.index_to_weight[l] for l in labels])
             else:
                 self.index_to_weight = {k:1. for k in range(len(self.speakers))}
-                feed = self.create_feed_dict(lines, line_lengths, labels)
-            if SUPERDEBUG:
-                debugstate, loss, total_correct, _ = session.run([self.state, self.loss, self.correct_predictions, self.train_op], feed_dict=feed)
-                print debugstate
-                sys.exit()
-            else:
-                loss, total_correct, _ = session.run([self.loss, self.correct_predictions, self.train_op], feed_dict=feed)
+                feed = self.create_feed_dict(lines, line_lengths, labels, dp, l2)
+            loss, total_correct, _ = session.run([self.loss, self.correct_predictions, self.train_op], feed_dict=feed)
             total_processed_examples += len(labels)
             total_correct_examples += total_correct
             total_loss.append(loss)
@@ -219,105 +219,85 @@ class WhoseLineSoftmaxModel(WhoseLineModel):
             sys.stdout.flush()
         return np.mean(total_loss), total_correct_examples / float(total_processed_examples)
     
-    def predict(self, session, input_data):
-        dp = 1
+    def predict(self, session, input_data, disallow_other=False):
+        dp = 1.
+        l2 = 0.
         losses = []
         results = []
         data = data_iterator(input_data, batch_size=self.config.batch_size, chop_limit=self.config.max_line_length)
         for step, (lines, line_lengths, labels) in enumerate(data):
-            feed = self.create_feed_dict(lines, line_lengths, labels)
-            loss, preds = session.run([self.loss, self.predictions], feed_dict=feed)
+            feed = self.create_feed_dict(lines, line_lengths, labels, dp, l2, [self.index_to_weight[l] for l in labels])
+            loss, preds, predicted_indices = session.run([self.loss, self.predictions, self.one_hot_predictions], feed_dict=feed)
+            if disallow_other:
+                preds[:,self.speakers.speaker_to_index["OTHER"]] = 0.
+                predicted_indices = preds.argmax(axis=1)
             losses.append(loss)
-            predicted_indices = preds.argmax(axis=1)
             results.extend(predicted_indices)
         return np.mean(losses), results
 
-class WhoseLineRNNModel(WhoseLineSoftmaxModel):       
-    def add_model(self):
-        embed_size = self.config.embed_size
-        num_speakers = len(self.speakers)
-        with tf.variable_scope("linear_softmax"):
-            W = tf.get_variable("weights", (embed_size, num_speakers), initializer=xavier_weight_init())
-            b = tf.get_variable("biases", (num_speakers,))
-        # rnncell = BasicRNNCell(embed_size)
-        rnncell = GRUCell(embed_size)
-        embedded_lines = tf.gather(self.tf_embedding_matrix, self.lines_placeholder)
-        _, self.state = tf.nn.dynamic_rnn(rnncell,
-                                          embedded_lines,
-                                          self.line_length_placeholder,
-                                          dtype = tf.float32) # state = sum of wvs
-                                          # initial_state = tf.zeros((batch_size, embed_size)))
-        return tf.matmul(self.state, W) + b  # logits
+class WhoseLine_RNN_NoContext_Model(WhoseLineSoftmaxModel):
 
-    # def add_training_op(self, loss):
-    #     opt = tf.train.AdamOptimizer(self.config.lr)
-    #     # opt = tf.train.GradientDescentOptimizer(self.config.lr)
-    #     train_op = opt.minimize(loss)
-    #     return train_op
+    def add_sentence_summaries(self, wordvector_embed_size):
+        if self.config.bidirectional_sentences:
+            forwardcell = DropoutWrapper(GRUCell(wordvector_embed_size), self.dropout_placeholder, self.dropout_placeholder)
+            backwardcell = DropoutWrapper(GRUCell(wordvector_embed_size), self.dropout_placeholder, self.dropout_placeholder)
+            _, statefw, statebw = bidirectional_dynamic_rnn(forwardcell, backwardcell,
+                                                            self.embedded_lines, self.line_length_placeholder,
+                                                            dtype = tf.float32, scope = "LineRNN")
+            self.sentence_summaries = tf.concat(1, [statefw, statebw])
+            return 2*wordvector_embed_size
+        else:
+            rnncell = DropoutWrapper(GRUCell(wordvector_embed_size), self.dropout_placeholder, self.dropout_placeholder)
+            _, self.sentence_summaries = tf.nn.dynamic_rnn(rnncell,
+                                                           self.embedded_lines, self.line_length_placeholder,
+                                                           dtype = tf.float32, scope = "LineRNN")
+            return wordvector_embed_size
 
-class WhoseLineBiRNNModel(WhoseLineSoftmaxModel):       
-    def add_model(self):
-        embed_size = self.config.embed_size
-        num_speakers = len(self.speakers)
-        with tf.variable_scope("linear_softmax"):
-            W = tf.get_variable("weights", (2*embed_size, num_speakers), initializer=xavier_weight_init())
-            b = tf.get_variable("biases", (num_speakers,))
-        # rnncell = BasicRNNCell(embed_size)
-        forwardcell = GRUCell(embed_size)
-        backwardcell = GRUCell(embed_size)
-        embedded_lines = tf.gather(self.tf_embedding_matrix, self.lines_placeholder)
-        _, statefw, statebw = bidirectional_dynamic_rnn(forwardcell, backwardcell,
-                                                        embedded_lines,
-                                                        self.line_length_placeholder,
-                                                        dtype = tf.float32) # state = sum of wvs
-                                                        # initial_state = tf.zeros((batch_size, embed_size)))
-        self.state = tf.concat(1, [statefw, statebw])
-        return tf.matmul(self.state, W) + b  # logits
+class WhoseLine_MeanWV_RNN_Model(WhoseLineSoftmaxModel):
 
-class WhoseLineBiStackedBiRNNModel(WhoseLineSoftmaxModel):       
-    def add_model(self):
-        embed_size = self.config.embed_size
-        num_speakers = len(self.speakers)
-        with tf.variable_scope("linear_softmax"):
-            W = tf.get_variable("weights", (4*embed_size, num_speakers), initializer=xavier_weight_init())
-            b = tf.get_variable("biases", (num_speakers,))
-        # rnncell = BasicRNNCell(embed_size)
-        forwardcell = GRUCell(embed_size)
-        backwardcell = GRUCell(embed_size)
-        embedded_lines = tf.gather(self.tf_embedding_matrix, self.lines_placeholder)
-        _, statefw, statebw = bidirectional_dynamic_rnn(forwardcell, backwardcell,
-                                                        embedded_lines,
-                                                        self.line_length_placeholder,
-                                                        dtype = tf.float32, scope = "LineBiRNN") # state = sum of wvs
-                                                        # initial_state = tf.zeros((batch_size, embed_size)))
-        line_vectors = tf.concat(1, [statefw, statebw])   # "summarized" lines
-        forwardcell = GRUCell(2*embed_size)
-        backwardcell = GRUCell(2*embed_size)
-        line_vectors_as_timesteps = tf.expand_dims(line_vectors, 0)
-        outputs, sf, sb = bidirectional_dynamic_rnn(forwardcell, backwardcell,
-                                                    line_vectors_as_timesteps,
-                                                    tf.slice(tf.shape(line_vectors_as_timesteps),[1],[1]),  # what the fucking fuck
-                                                    dtype = tf.float32, scope = "ChapterBiRNN") # state = sum of wvs
-                                                    # initial_state = tf.zeros((batch_size, embed_size)))
-        return tf.matmul(tf.squeeze(outputs), W) + b  # logits
+    def add_conversational_context(self, sentence_summary_size):
+        line_vectors_as_timesteps = tf.expand_dims(self.sentence_summaries, 0)
+        if self.config.bidirectional_conversations:
+            forwardcell = DropoutWrapper(GRUCell(sentence_summary_size), self.dropout_placeholder, self.dropout_placeholder)
+            backwardcell = DropoutWrapper(GRUCell(sentence_summary_size), self.dropout_placeholder, self.dropout_placeholder)
+            outputs, sf, sb = bidirectional_dynamic_rnn(forwardcell, backwardcell,
+                                                        line_vectors_as_timesteps,
+                                                        tf.slice(tf.shape(line_vectors_as_timesteps),[1],[1]),  # what the fucking fuck
+                                                        dtype = tf.float32, scope = "ChapterRNN")
+            self.conversation_state = tf.squeeze(outputs)
+            return 2*sentence_summary_size
+        else:
+            rnncell = DropoutWrapper(GRUCell(sentence_summary_size), self.dropout_placeholder, self.dropout_placeholder)
+            outputs, state = tf.nn.dynamic_rnn(rnncell,
+                                               line_vectors_as_timesteps,
+                                               tf.slice(tf.shape(line_vectors_as_timesteps),[1],[1]),  # what the fucking fuck
+                                               dtype = tf.float32, scope = "ChapterRNN")
+            self.conversation_state = tf.squeeze(outputs)
+            return sentence_summary_size
+
+class WhoseLine_RNN_RNN_Model(WhoseLine_RNN_NoContext_Model, WhoseLine_MeanWV_RNN_Model):       
+    pass
 
 
-def test(modeltype=ModelType.BASIC_SOFTMAX):
+def test(sentencernn, contextrnn, sentencebi, contextbi):
     config = Config()
+    config.bidirectional_sentences = sentencebi
+    config.bidirectional_conversations = contextbi
     with tf.Graph().as_default():
-        if modeltype == ModelType.BASIC_SOFTMAX:
+        if not sentencernn and not contextrnn:
             model = WhoseLineSoftmaxModel(config)
-        elif modeltype == ModelType.BASIC_RNN:
-            model = WhoseLineRNNModel(config)
-        elif modeltype == ModelType.BASIC_BIRNN:
-            model = WhoseLineBiRNNModel(config)
-        elif modeltype == ModelType.BI_BIRNN:
-            model = WhoseLineBiStackedBiRNNModel(config)
+        elif sentencernn and not contextrnn:
+            model = WhoseLine_RNN_NoContext_Model(config)
+        elif not sentencernn and contextrnn:
+            model = WhoseLine_MeanWV_RNN_Model(config)
+        else:
+            model = WhoseLine_RNN_RNN_Model(config)
 
         init = tf.initialize_all_variables()
         saver = tf.train.Saver()
 
         with tf.Session() as session:
+            prev_train_loss = float('inf')
             best_val_loss = float('inf')
             best_val_epoch = 0
 
@@ -331,12 +311,20 @@ def test(modeltype=ModelType.BASIC_SOFTMAX):
                 print 'Training loss: {}'.format(train_loss)
                 print 'Training acc: {}'.format(train_acc)
                 print 'Validation loss: {}'.format(val_loss)
+
+                #lr annealing
+                if train_loss > prev_train_loss*model.config.anneal_threshold:
+                    model.config.lr /= model.config.anneal_by
+                    print 'annealed lr to %f'%model.config.lr
+                prev_train_loss = train_loss
+
+                # save if model has improved on val
                 if val_loss < best_val_loss:
                     best_val_loss = val_loss
                     best_val_epoch = epoch
                     if not os.path.exists("./weights"):
                         os.makedirs("./weights")
-                    saver.save(session, './weights/basic_softmax.weights')
+                    saver.save(session, './weights/whose_line.weights')
                 if epoch - best_val_epoch > config.early_stopping:
                     break
                 ###
@@ -348,12 +336,23 @@ def test(modeltype=ModelType.BASIC_SOFTMAX):
                 print_confusion(confusion, model.speakers.index_to_speaker, model.index_to_weight)
                 print 'Total time: {}'.format(time.time() - start)
 
-            # saver.restore(session, './weights/basic_softmax.weights')
-            # print 'Test'
-            # print '=-=-='
-            # print 'Writing predictions to q2_test.predicted'
-            # _, predictions = model.predict(session, model.X_test, model.y_test)
-            # save_predictions(predictions, "q2_test.predicted")
+            saver.restore(session, './weights/whose_line.weights')
+            print 'Test'
+            print '=-=-='
+            test_loss, predictions = model.predict(session, model.test_data)
+            print 'Best validation loss: {}'.format(best_val_loss)
+            print 'Test loss: {}'.format(test_loss)
+            if model.config.batch_size == "chapter":
+                test_ground_truth = [dp[1] for chapter in model.test_data for dp in chapter]
+            else:
+                test_ground_truth = [dp[1] for dp in model.test_data]
+            confusion = calculate_confusion(config, predictions, test_ground_truth)
+            print_confusion(confusion, model.speakers.index_to_speaker, model.index_to_weight)
+
+            _, predictions = model.predict(session, model.test_data, disallow_other=True)
+            confusion = calculate_confusion(config, predictions, test_ground_truth, disallow_other=True)
+            print_confusion(confusion, model.speakers.index_to_speaker, model.index_to_weight, disallow_other=True)
+
 
 if __name__ == "__main__":
     test()

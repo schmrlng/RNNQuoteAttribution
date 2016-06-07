@@ -1,7 +1,7 @@
-from RNNmodels import test, ModelType
+from RNNmodels import test
 
 if __name__ == "__main__":
-    # test(ModelType.BASIC_SOFTMAX)
-    # test(ModelType.BASIC_RNN)
-    # test(ModelType.BASIC_BIRNN)
-    test(ModelType.BI_BIRNN)
+    test(sentencernn = True, contextrnn = True, sentencebi = False, contextbi = False)
+    # test(sentencernn = True, contextrnn = False, sentencebi = True, contextbi = True)
+    # test(sentencernn = False, contextrnn = True, sentencebi = True, contextbi = True)
+    # test(sentencernn = True, contextrnn = True, sentencebi = True, contextbi = False)

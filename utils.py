@@ -115,8 +115,12 @@ class Speakers(object):
     def __len__(self):
         return len(self.speaker_freq)
 
-def print_confusion(confusion, num_to_tag, num_to_weight):
+def print_confusion(confusion, num_to_tag, num_to_weight, disallow_other=False):
     """Helper method that prints confusion matrix."""
+    if disallow_other:
+        for i, tag in num_to_tag.items():   # certainly not the best way to zero out the "OTHER" row, but it works
+            if tag == "OTHER":
+                confusion[i,:] = 0
     # Summing top to bottom gets the total number of tags guessed as T
     total_guessed_tags = confusion.sum(axis=0)
     # Summing left to right gets the total number of true tags
@@ -128,7 +132,7 @@ def print_confusion(confusion, num_to_tag, num_to_weight):
         recall = confusion[i, i] / float(total_true_tags[i])
         print ('Speaker: {:10} - P {:7.4f} / R {:7.4f} / F1 {:7.4f} \t (loss weight {:6.3f})'.format(tag, prec, recall, 2*prec*recall/(prec+recall), num_to_weight[i])).expandtabs(10)
 
-def calculate_confusion(config, predicted_indices, y_indices):
+def calculate_confusion(config, predicted_indices, y_indices, disallow_other=False):
     """Helper method that calculates confusion matrix."""
     confusion = np.zeros((config.speaker_count, config.speaker_count), dtype=np.int32)
     for i in xrange(len(y_indices)):
